@@ -1,0 +1,9 @@
+__pycache__/
+data/
+*.pyc
+*.tar.gz
+*.mat
+*.png
+cifar-10-batches-py/
+train-*.gz
+t10k-*.gz
