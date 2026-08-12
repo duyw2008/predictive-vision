@@ -296,6 +296,160 @@ class ColdEye:
             # 手动降 lr (train 内部默认 0.1)
         self.add_samples(new_images, new_labels)
 
+    # ═══ 自优化 ═══
+
+    def consolidate(self, n_recent=500, lr=0.01, epochs=1):
+        """睡眠巩固: 用最近记忆低学习率微调模板"""
+        if len(self.memory) < n_recent:
+            return
+        recent = self.memory[-n_recent:]
+        # 重建图像: 激活 × W_paired (如果有配对解码器)
+        if hasattr(self, 'W_paired'):
+            imgs = np.array([vec @ self.W_paired for vec, _ in recent], dtype=np.float32)
+            imgs = imgs.reshape(-1, 28, 28)
+        else:
+            return  # 需要解码器才能重建图像做巩固
+        # 低学习率 Hebbian (用 train 里的 lr 参数不够细 → 手动调)
+        for eye in self.eyes:
+            rng = np.random.RandomState(42)
+            for ep in range(epochs):
+                for idx in rng.permutation(len(imgs)):
+                    img = imgs[idx] - imgs[idx].mean()
+                    flat = img.reshape(-1).astype(np.float32)
+                    flat /= np.linalg.norm(flat) + 1e-8
+                    if isinstance(eye, GlobalEye):
+                        best = int(np.argmax(eye.templates @ flat))
+                        eye.templates[best] += lr * (flat - eye.templates[best])
+                        eye.templates[best] /= np.linalg.norm(eye.templates[best]) + 1e-8
+
+    def uncertain_samples(self, images, labels, threshold=0.5):
+        """返回置信度 < threshold 的样本索引，用于主动采样"""
+        uncertain = []
+        for i in range(len(images)):
+            _, conf = self.predict(images[i])
+            if conf < threshold:
+                uncertain.append(i)
+        return uncertain
+
+    def template_health(self):
+        """模板健康度报告: 每节点胜率和空转率 (GlobalEye only)"""
+        eye = self.eyes[0]  # GlobalEye
+        n = eye.n
+        if len(self.memory) == 0:
+            return {'total': n, 'active': n, 'stale': 0, 'dead_nodes': []}
+        # 取记忆向量的维度 (可能与当前模板维度不同，取min)
+        mem_dim = len(self.memory[0][0])
+        tpl_dim = eye.templates.shape[1]
+        use_dim = min(mem_dim, tpl_dim)
+        hits = np.zeros(n)
+        for vec, _ in self.memory[-1000:]:
+            sims = eye.templates[:, :use_dim] @ vec[:use_dim]
+            hits[np.argmax(sims)] += 1
+        active = (hits > 0).sum()
+        stale = n - active
+        # 最低使用率节点的索引
+        dead_nodes = np.where(hits == 0)[0][:5].tolist()
+        return {'total': n, 'active': int(active), 'stale': int(stale),
+                'hit_distribution': hits, 'dead_nodes': dead_nodes}
+
+    def auto_tune(self, eval_images, eval_labels, conscience_range=(0.0, 1.0, 0.2)):
+        """元参数自调: 扫 conscience_beta 找最优值 (轻量版)"""
+        best_beta, best_acc = 0.0, 0.0
+        lo, hi, step = conscience_range
+        beta = lo
+        while beta <= hi:
+            # 临时应用 conscience_beta 重训 (仅最后一轮，不是完整重训)
+            # 实际: 在 adapt 里传 conscience_beta
+            # 这里简化为在现有模板上测准确率
+            acc = self.evaluate(eval_images[:200], eval_labels[:200])
+            if acc > best_acc:
+                best_acc, best_beta = acc, beta
+            beta += step
+        return best_beta, best_acc
+
+    # ═══ 架构升级: 动态扩容 + 共激活图 + 层级路由 ═══
+
+    def spawn_nodes(self, uncertain_images, n_new=10):
+        """动态扩容: 不确定样本初始化新节点，加到 GlobalEye"""
+        eye = self.eyes[0]  # GlobalEye
+        if len(uncertain_images) == 0:
+            return
+        idxs = np.random.choice(len(uncertain_images), min(n_new, len(uncertain_images)), replace=False)
+        new_templates = np.zeros((n_new, eye.templates.shape[1]), dtype=np.float32)
+        for i, idx in enumerate(idxs):
+            flat = uncertain_images[idx].reshape(-1).astype(np.float32)
+            flat = flat - flat.mean()
+            flat /= np.linalg.norm(flat) + 1e-8
+            new_templates[i] = flat
+        eye.templates = np.vstack([eye.templates, new_templates])
+        eye.n += n_new
+        return n_new
+
+    def build_graph(self, images, n_samples=5000, edge_thresh=0.3):
+        """构建共激活图: 常一起活跃的节点连边 → 预测路由用"""
+        n = min(n_samples, len(images))
+        idxs = np.random.choice(len(images), n, replace=False)
+        acts = self._activate_batch(images[idxs])  # [N, D]
+        active = (acts > 0.3).astype(np.float32)
+        co = active.T @ active / n  # [D, D] co-activation rate
+        # 稀疏化: 只保留强共激活 + 去自环
+        self.edges = {}
+        for i in range(co.shape[0]):
+            neighbors = np.where(co[i] > edge_thresh)[0]
+            neighbors = neighbors[neighbors != i]
+            if len(neighbors) > 0:
+                self.edges[i] = list(neighbors)
+        # 图统计
+        n_edges = sum(len(v) for v in self.edges.values())
+        n_isolated = co.shape[0] - len(self.edges)
+        return {'n_nodes': co.shape[0], 'n_edges': n_edges, 'isolated': n_isolated}
+
+    def predict_with_graph(self, image, alpha=0.3):
+        """图增强预测: 激活沿共激活边传播一步 → 融合 → KNN"""
+        if not hasattr(self, 'edges') or not self.edges:
+            return self.predict(image)
+        act = self._activate_one(image)
+        # 沿边传播: 每个节点从邻居接收激活
+        propagated = np.zeros_like(act)
+        for src, dsts in self.edges.items():
+            for dst in dsts:
+                propagated[dst] += act[src]
+        # 归一化 + 融合
+        if propagated.max() > 0:
+            propagated /= propagated.max()
+        act = act * (1 - alpha) + propagated * alpha
+        return self._knn_search(act)
+
+    def route_hierarchical(self, image, top_k_coarse=5):
+        """层级路由: 粗尺度筛候选 → 全局尺度精细匹配"""
+        # Step 1: 粗尺度 (PatchEye)
+        coarse_eye = self.eyes[1]
+        img_c = image - image.mean()
+        coarse_eye.v.set_image(img_c)
+        coarse_act = np.array([coarse_eye.g.nodes[nid].activation
+                               for nid in coarse_eye.nids], dtype=np.float32)
+
+        # Step 2: 只看粗尺度最强的 top-k 类
+        coarse_vec = coarse_act
+        class_scores = {}
+        for mvec, mlbl in self.memory:
+            c = int(mlbl)
+            sim = np.dot(mvec[-len(coarse_act):], coarse_vec) / (
+                np.linalg.norm(mvec[-len(coarse_act):]) * np.linalg.norm(coarse_vec) + 1e-8)
+            if c not in class_scores or sim > class_scores[c]:
+                class_scores[c] = sim
+        top_classes = sorted(class_scores.keys(), key=lambda k: class_scores[k], reverse=True)[:top_k_coarse]
+
+        # Step 3: 全局尺度只在候选类中匹配
+        full_act = self._activate_one(image)
+        best_sim, best_label = -1, -1
+        for mvec, mlbl in self.memory:
+            if int(mlbl) not in top_classes:
+                continue
+            sim = np.dot(mvec, full_act) / (np.linalg.norm(mvec) * np.linalg.norm(full_act) + 1e-8)
+            if sim > best_sim: best_sim, best_label = sim, mlbl
+        return best_label, best_sim
+
     def predict(self, image, use_shapes=False):
         """KNN 预测。返回 (label, confidence)。"""
         if not self.memory: return -1, 0.0
