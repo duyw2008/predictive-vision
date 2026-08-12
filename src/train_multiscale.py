@@ -385,6 +385,25 @@ class ColdEye:
         eye.n += n_new
         return n_new
 
+    def recycle_nodes(self, uncertain_images, max_recycle=None):
+        """回收死节点: 把低胜率模板重初始化为不确定样本"""
+        eye = self.eyes[0]  # GlobalEye
+        health = self.template_health()
+        # 用胜率排序，取最低的 (不是只看零命中)
+        hits = health['hit_distribution']
+        low_nodes = np.argsort(hits)[:max_recycle] if max_recycle else np.where(hits == 0)[0]
+        if len(low_nodes) == 0 or len(uncertain_images) == 0:
+            return 0
+
+        n_recycle = min(len(low_nodes), len(uncertain_images))
+        idxs = np.random.choice(len(uncertain_images), n_recycle, replace=False)
+        for i, node_idx in enumerate(low_nodes[:n_recycle]):
+            flat = uncertain_images[idxs[i]].reshape(-1).astype(np.float32)
+            flat = flat - flat.mean()
+            flat /= np.linalg.norm(flat) + 1e-8
+            eye.templates[node_idx] = flat
+        return n_recycle
+
     def build_graph(self, images, n_samples=5000, edge_thresh=0.3):
         """构建共激活图: 常一起活跃的节点连边 → 预测路由用"""
         n = min(n_samples, len(images))
