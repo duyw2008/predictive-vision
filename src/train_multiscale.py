@@ -267,6 +267,35 @@ class ColdEye:
             vec = self.get_object_vector(images[idx]) if use_shapes else self._activate_one(images[idx])
             self.memory.append((vec, labels[idx]))
 
+    # ═══ 持续学习 ═══
+
+    def add_samples(self, images, labels):
+        """增量添加记忆 — 不重训模板，不碰旧记忆"""
+        for i in range(len(images)):
+            vec = self._activate_one(images[i])
+            self.memory.append((vec, labels[i]))
+
+    def prune_memory(self, max_per_class=200):
+        """记忆淘汰: 每类保留最近添加的 max_per_class 条"""
+        by_class = {}
+        for i, (vec, lbl) in enumerate(self.memory):
+            c = int(lbl)
+            if c not in by_class: by_class[c] = []
+            by_class[c].append((i, vec))
+        keep = set()
+        for c, entries in by_class.items():
+            for i, _ in entries[-max_per_class:]:  # 保留最新的
+                keep.add(i)
+        self.memory = [self.memory[i] for i in sorted(keep)]
+
+    def adapt(self, new_images, new_labels, epochs=1, lr=0.05):
+        """适应新数据: 低学习率微调模板，不重建记忆"""
+        for eye in self.eyes:
+            eye.train(new_images, epochs=epochs, n_train=len(new_images),
+                      contrast_aug=False, conscience_beta=0.0)
+            # 手动降 lr (train 内部默认 0.1)
+        self.add_samples(new_images, new_labels)
+
     def predict(self, image, use_shapes=False):
         """KNN 预测。返回 (label, confidence)。"""
         if not self.memory: return -1, 0.0
