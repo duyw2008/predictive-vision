@@ -73,24 +73,37 @@ model = ColdEye(eye_specs=[
 | 训练 | Hebbian, CPU, 1s/1K | BP, GPU, 分钟级 |
 | 少样本 | 1-shot 30% | 需要全量重训 |
 
-## 文件
+## 目录结构
 
-| 文件 | 用途 |
-|------|------|
-| `train_multiscale.py` | **主文件**: ColdEye, GlobalEye, PatchEye |
-| `graph.py` | VisionGraph + VisionNode |
-| `vision.py` | VisionInterface (竞争路由) |
-| `synapse.py` | SynapticLayer (Colony用, v3不用) |
-| `vision_colony.py` | VisionColony (MNIST无效, 保留) |
-| `benchmark_fashion.py` | Fashion-MNIST 跨域验证 |
-| `benchmark_conscience.py` | 良心机制 sweep |
-| `benchmark_brainfill_paired.py` | 配对脑补 + 闭环推理 |
-| `benchmark_fewshot_capacity.py` | 少样本 + 容量 scaling |
-| `benchmark_occlusion.py` | 遮挡 + FB 测试 |
-| `benchmark_global_v2.py` | v1→v2→v3 发现过程 |
-| `diag_centering.py` | **突破验证**: centering vs raw |
-| `diag_scale_profile.py` | 三尺度独立 profiling |
-| `demo_feedback_brainfill.py` | FB + 脑补 demo |
+```
+src/            — 核心源码
+  train_multiscale.py  — 主文件: ColdEye, GlobalEye, PatchEye
+  graph.py             — VisionGraph + VisionNode
+  vision.py            — VisionInterface (竞争路由)
+  synapse.py           — SynapticLayer (Colony用, v3不用)
+  vision_colony.py     — VisionColony (MNIST无效, 保留)
+
+benchmarks/     — 活跃 benchmark
+  benchmark_fashion.py            — Fashion-MNIST 跨域验证
+  benchmark_conscience.py         — 良心机制 sweep
+  benchmark_brainfill_paired.py   — 配对脑补 + 闭环推理
+  benchmark_fewshot_capacity.py   — 少样本 + 容量 scaling
+  benchmark_occlusion.py          — 遮挡 + FB 测试
+  benchmark_global_v2.py          — v1→v2→v3 发现过程
+  benchmark_v3_full.py            — v3 全配验证
+  benchmark_20class.py            — 20类混合验证
+  benchmark_two_step.py           — 两步推理验证
+  benchmark_retina_multiscale.py  — retina vs multi-scale
+
+diagnostics/    — 诊断工具
+  diag_centering.py     — **突破验证**: centering vs raw
+  diag_scale_profile.py — 三尺度独立 profiling
+
+demos/          — 演示
+  demo_feedback_brainfill.py — FB + 脑补 demo
+
+deprecated/     — 废弃脚本 (Colony, retina, brainfill v1, 旧 FB)
+```
 
 ## 架构演化
 

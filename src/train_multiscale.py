@@ -374,23 +374,46 @@ class ColdEye:
         h, w = image.shape[:2]
         return (act @ self.W_paired).reshape(h, w)
 
-    def predict_brainfill(self, image, alpha=0.5, n_iter=2):
-        """闭环脑补推理:
-        1. 看降质图 → 激活
-        2. 激活 → 脑补重建干净图
-        3. 重建图 → 重新路由 → 激活
-        4. 融合原始+重建激活 → KNN
-        可迭代多轮"""
+    def predict_brainfill(self, image, alpha=0.5, max_iter=5, conf_thresh=0.85, tol=0.005):
+        """迭代闭环推理: 至少脑补一次，不确定时继续迭代直到收敛。
+
+        alpha: 基础融合系数
+        conf_thresh: 余弦相似度超过此值 → 足够确定，停止 (设得高以确保至少迭代一次)
+        tol: 激活变化 < tol → 收敛
+        """
         if not hasattr(self, 'W_paired') or not self.memory:
             return self.predict(image)
 
         act = self._activate_one(image)
-        for _ in range(n_iter):
+        prev_act = act.copy()
+        best_label, best_sim = -1, -1
+
+        for it in range(max_iter):
+            # 置信度
+            best_sim, best_label = -1, -1
+            for mvec, mlbl in self.memory:
+                sim = np.dot(mvec, act) / (np.linalg.norm(mvec) * np.linalg.norm(act) + 1e-8)
+                if sim > best_sim: best_sim, best_label = sim, mlbl
+
+            # 高置信 + 至少迭代过一次 → 停止
+            if it > 0 and best_sim >= conf_thresh:
+                break
+
+            # 脑补重建 + 重路由
             recon = (act @ self.W_paired).reshape(image.shape[0], image.shape[1])
             act_recon = self._activate_one(recon)
-            act = act * (1 - alpha) + act_recon * alpha
 
-        return self._knn_search(act)
+            # 融合 (首次迭代偏保守，后续偏脑补)
+            a = alpha * (0.5 if it == 0 else 1.0)
+            act_new = act * (1 - a) + act_recon * a
+
+            shift = np.max(np.abs(act_new - prev_act))
+            if shift < tol:
+                break
+            prev_act = act
+            act = act_new
+
+        return best_label, best_sim
 
     def evaluate_with_feedback(self, images, labels, alpha=0.5):
         correct = 0
