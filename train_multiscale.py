@@ -349,6 +349,49 @@ class ColdEye:
         h, w = image.shape[:2]
         return (act @ self.W).reshape(h, w)
 
+    # ═══ 配对脑补 + 闭环推理 ═══
+
+    def build_paired_decoder(self, clean_images, degrade_fn, n_samples=10000):
+        """学习 W_paired: act(降质图) → clean_image
+        degrade_fn(images) → degraded images (same shape)"""
+        n = min(n_samples, len(clean_images))
+        idxs = np.random.choice(len(clean_images), n, replace=False)
+        clean_batch = clean_images[idxs]
+        degraded = degrade_fn(clean_batch)
+
+        acts = self._activate_batch(degraded)           # [N, 150] from degraded
+        flat_clean = clean_batch.reshape(n, -1).astype(np.float32)  # [N, 784]
+
+        ATA = acts.T @ acts
+        ATI = acts.T @ flat_clean
+        self.W_paired = (np.linalg.pinv(ATA) @ ATI).astype(np.float32)
+
+    def reconstruct_paired(self, image):
+        """脑补: 降质图激活 → 重建干净图"""
+        if not hasattr(self, 'W_paired'):
+            raise RuntimeError("先 build_paired_decoder()")
+        act = self._activate_one(image)
+        h, w = image.shape[:2]
+        return (act @ self.W_paired).reshape(h, w)
+
+    def predict_brainfill(self, image, alpha=0.5, n_iter=2):
+        """闭环脑补推理:
+        1. 看降质图 → 激活
+        2. 激活 → 脑补重建干净图
+        3. 重建图 → 重新路由 → 激活
+        4. 融合原始+重建激活 → KNN
+        可迭代多轮"""
+        if not hasattr(self, 'W_paired') or not self.memory:
+            return self.predict(image)
+
+        act = self._activate_one(image)
+        for _ in range(n_iter):
+            recon = (act @ self.W_paired).reshape(image.shape[0], image.shape[1])
+            act_recon = self._activate_one(recon)
+            act = act * (1 - alpha) + act_recon * alpha
+
+        return self._knn_search(act)
+
     def evaluate_with_feedback(self, images, labels, alpha=0.5):
         correct = 0
         for i in range(len(images)):
