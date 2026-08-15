@@ -138,6 +138,38 @@ class PatchEye:
         self.v.set_image(img_c)
         return np.array([self.g.nodes[nid].activation for nid in self.nids], dtype=np.float32)
 
+    def hotspot_activation(self, image, n_regions=4):
+        """空间热点激活: 每个 patch 的 winner 节点按「节点学到的热点位置」归网格.
+        返回 [n_regions² × n_nodes] 向量 — 空间信息从结构涌现, 非手动分桶.
+        (费曼脑思路: 节点累积位置 → 热点, 重建时用热点而非 patch 物理位置, 避免边界断裂)"""
+        img_c = image - image.mean()
+        self.v.set_image(img_c)
+        patches = self.v._last_patches
+        positions = self.v.extractor.patch_positions
+        n_nodes = len(self.nids)
+        if patches is None or len(patches) == 0:
+            return np.zeros(n_regions * n_regions * n_nodes, np.float32)
+        H, W = image.shape[:2]
+        ra = np.zeros((n_regions, n_regions, n_nodes), np.float32)
+        templates = np.array([self.g.nodes[nid].template for nid in self.nids], np.float32)
+        for p_i, (y1, x1, y2, x2) in enumerate(positions):
+            if p_i >= len(patches):
+                break
+            scores = templates @ patches[p_i]
+            best = int(np.argmax(scores))
+            if scores[best] < 0:
+                continue
+            nid = self.nids[best]
+            hp = self.g.nodes[nid].spatial_hotspot
+            if hp is None:
+                continue
+            hcy, hcx = hp
+            ry = min(int(hcy / (H / n_regions)), n_regions - 1)
+            rx = min(int(hcx / (W / n_regions)), n_regions - 1)
+            ra[ry, rx, best] += 1.0
+        ra = ra.reshape(n_regions * n_regions, n_nodes)
+        return np.minimum(1.0, ra / (np.maximum(ra.sum(axis=1, keepdims=True), 1e-8)) * 3).reshape(-1)
+
 
 # ═══════════════════════════════════════════
 #  ColdEye v3
@@ -550,6 +582,32 @@ class ColdEye:
         act = self._activate_one(image)
         h, w = image.shape[:2]
         return (act @ self.W).reshape(h, w)
+
+    # ═══ 空间热点脑补 (费曼脑"给容量" — 空间信息从结构涌现) ═══
+
+    def build_decoder_hotspot(self, images, n_samples=10000, n_regions=4):
+        """学习热点重建解码器: 空间热点激活 → 图像.
+        热点激活 = 节点学到的空间位置归网格, 非 patch 物理位置 (避免边界断裂)"""
+        patch_eyes = [e for e in self.eyes if isinstance(e, PatchEye)]
+        if not patch_eyes:
+            raise RuntimeError("热点重建需要至少一个 patch eye")
+        n = min(n_samples, len(images))
+        idxs = np.random.choice(len(images), n, replace=False)
+        acts = np.array([np.concatenate([e.hotspot_activation(images[i], n_regions) for e in patch_eyes])
+                         for i in idxs], np.float32)
+        flat = images[idxs].reshape(n, -1).astype(np.float32)
+        ATA = acts.T @ acts
+        ATI = acts.T @ flat
+        self.W_hotspot = (np.linalg.pinv(ATA) @ ATI).astype(np.float32)
+
+    def reconstruct_hotspot(self, image, n_regions=4):
+        """热点脑补: 空间热点激活 → 重建图像"""
+        if not hasattr(self, 'W_hotspot'):
+            raise RuntimeError("先 build_decoder_hotspot()")
+        patch_eyes = [e for e in self.eyes if isinstance(e, PatchEye)]
+        act = np.concatenate([e.hotspot_activation(image, n_regions) for e in patch_eyes])
+        h, w = image.shape[:2]
+        return (act @ self.W_hotspot).reshape(h, w)
 
     # ═══ 配对脑补 + 闭环推理 ═══
 

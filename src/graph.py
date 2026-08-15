@@ -43,6 +43,24 @@ class VisionNode:
         self.last_active_gen = 0
         self.frozen = False  # 冻结后不更新模板 (预训练好的底层特征)
 
+        # 空间热点: 节点每赢一个 patch 累积位置 → 空间拓扑从结构涌现 (费曼脑"给容量不给方法")
+        self.spatial_cy = 0.0
+        self.spatial_cx = 0.0
+        self.spatial_count = 0
+
+    def accumulate_spatial(self, cy: float, cx: float):
+        """节点赢 patch 时累积位置 → 空间热点 (统计平均) 涌现"""
+        self.spatial_cy += cy
+        self.spatial_cx += cx
+        self.spatial_count += 1
+
+    @property
+    def spatial_hotspot(self):
+        """节点空间热点 (cy, cx), 未累积过则 None"""
+        if self.spatial_count == 0:
+            return None
+        return (self.spatial_cy / self.spatial_count, self.spatial_cx / self.spatial_count)
+
     def to_dict(self) -> dict:
         return {
             "id": self.node_id,

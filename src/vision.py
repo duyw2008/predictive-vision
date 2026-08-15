@@ -87,7 +87,7 @@ class VisionInterface:
         match_counts = {}
         match_patches = {}
 
-        for patch in patches:
+        for p_i, patch in enumerate(patches):
             scores = templates @ patch * boost_vec
             best_idx = int(np.argmax(scores))
             if float(scores[best_idx]) < 0:
@@ -97,6 +97,10 @@ class VisionInterface:
             if nid not in match_patches:
                 match_patches[nid] = []
             match_patches[nid].append(patch)
+            # 累积空间热点: 节点赢 patch 时记录位置 (费曼脑"给容量" — 空间拓扑从结构涌现)
+            if p_i < len(self.extractor.patch_positions):
+                y1, x1, y2, x2 = self.extractor.patch_positions[p_i]
+                self.graph.nodes[nid].accumulate_spatial((y1 + y2) / 2, (x1 + x2) / 2)
 
         for nid, count in match_counts.items():
             self.graph.nodes[nid].activation = min(1.0, count / n_patches * 3)
