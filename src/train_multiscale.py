@@ -20,13 +20,14 @@ class GlobalEye:
 
     def __init__(self, n_nodes=100, seed=None):
         self.n = n_nodes
-        self.templates = np.empty((n_nodes, 784), dtype=np.float32)
+        self.templates = None  # 动态尺寸: init_templates 时按图像维度分配 (28×28=784 或 32×32=1024)
         self.rng = np.random.RandomState(seed) if seed is not None else np.random
 
     def init_templates(self, images):
         idxs = self.rng.choice(len(images), min(200, len(images)), replace=False)
         patches = images[idxs].reshape(len(idxs), -1).astype(np.float32)
         patches = patches - patches.mean(axis=1, keepdims=True)
+        self.templates = np.empty((self.n, patches.shape[1]), dtype=np.float32)
         for i in range(self.n):
             self.templates[i] = patches[i % len(patches)]
             self.templates[i] /= np.linalg.norm(self.templates[i]) + 1e-8
@@ -706,6 +707,32 @@ def load_mnist(path="data"):
 def low_contrast(X, c):
     Xc = X.copy(); m = Xc.mean(axis=(1,2), keepdims=True)
     return m + (Xc - m) * c
+
+
+def load_cifar10(path="data/cifar10", n_train_per_class=None, n_test_per_class=None):
+    """加载 CIFAR-10 (fast.ai 图片格式: {train,test}/{class}/{id}.png), 转灰度 32×32.
+    返回 (X_tr, y_tr, X_te, y_te) 灰度 [0,1]."""
+    from PIL import Image
+    classes = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+               'dog', 'frog', 'horse', 'ship', 'truck']  # 字母序 = 官方 label 顺序
+    cls_to_label = {c: i for i, c in enumerate(classes)}
+
+    def load_split(split, n_per_class):
+        X, y = [], []
+        for c in classes:
+            d = os.path.join(path, split, c)
+            files = sorted(os.listdir(d))
+            if n_per_class is not None:
+                files = files[:n_per_class]
+            for f in files:
+                arr = np.array(Image.open(os.path.join(d, f)).convert('L'),
+                               dtype=np.float32) / 255.0
+                X.append(arr); y.append(cls_to_label[c])
+        return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
+
+    X_tr, y_tr = load_split('train', n_train_per_class)
+    X_te, y_te = load_split('test', n_test_per_class)
+    return X_tr, y_tr, X_te, y_te
 
 
 # ═══════════════════════════════════════════
