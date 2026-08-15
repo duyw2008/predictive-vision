@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """迭代闭环推理 v2: 置信度门控 + 自适应融合 + 收敛检测"""
 import sys, os, numpy as np
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from train_multiscale import ColdEye, load_mnist
 
 def occlude(images, bs=8):
