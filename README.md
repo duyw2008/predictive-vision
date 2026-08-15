@@ -2,6 +2,8 @@
 
 竞争路由 + per-patch centering = **完美对比度不变性** (c=0.01 == c=1.0)
 
+> 📐 算法与模型的完整技术参考见 [ALGORITHMS.md](ALGORITHMS.md)。
+
 ## 架构
 
 ```
