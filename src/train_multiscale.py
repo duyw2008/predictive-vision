@@ -16,17 +16,30 @@ from vision import VisionInterface
 # ═══════════════════════════════════════════
 
 class GlobalEye:
-    """28×28 整图 → 竞争路由 → 激活向量。信号积分 784 维，低对比度鲁棒。"""
+    """整图 → 竞争路由 → 激活向量。支持灰度(单通道)和 RGB(3通道, per-channel centering)。
+
+    低对比度鲁棒: per-channel centering 让对比度 c 从数学上约掉 (每个通道独立减均值+L2)。"""
 
     def __init__(self, n_nodes=100, seed=None):
         self.n = n_nodes
-        self.templates = None  # 动态尺寸: init_templates 时按图像维度分配 (28×28=784 或 32×32=1024)
+        self.templates = None  # 动态尺寸: init_templates 时按图像维度分配 (28×28=784 / 32×32=1024 / RGB=3072)
         self.rng = np.random.RandomState(seed) if seed is not None else np.random
+
+    def _center(self, img):
+        """centering: RGB 3通道 per-channel (保持对比度不变性), 灰度整体。返回 flatten 向量."""
+        if img.ndim == 3:
+            flat = img.reshape(-1, img.shape[2]).astype(np.float32)  # (H*W, C)
+            flat = flat - flat.mean(axis=0, keepdims=True)
+            flat /= np.linalg.norm(flat, axis=0, keepdims=True) + 1e-8
+            return flat.reshape(-1)
+        flat = img.reshape(-1).astype(np.float32)
+        flat = flat - flat.mean()
+        flat /= np.linalg.norm(flat) + 1e-8
+        return flat
 
     def init_templates(self, images):
         idxs = self.rng.choice(len(images), min(200, len(images)), replace=False)
-        patches = images[idxs].reshape(len(idxs), -1).astype(np.float32)
-        patches = patches - patches.mean(axis=1, keepdims=True)
+        patches = np.array([self._center(images[i]) for i in idxs], dtype=np.float32)
         self.templates = np.empty((self.n, patches.shape[1]), dtype=np.float32)
         for i in range(self.n):
             self.templates[i] = patches[i % len(patches)]
@@ -42,11 +55,13 @@ class GlobalEye:
             for idx in rng.permutation(min(n_train, len(images))):
                 img = images[idx].copy()
                 if contrast_aug and rng.random() < 0.5:
-                    m = img.mean()
-                    img = m + (img - m) * (0.3 + rng.random() * 0.7)
-                flat = img.reshape(-1).astype(np.float32)
-                flat = flat - flat.mean()
-                flat /= np.linalg.norm(flat) + 1e-8
+                    if img.ndim == 3:  # RGB per-channel 对比度增强
+                        m = img.mean(axis=(0, 1), keepdims=True)
+                        img = m + (img - m) * (0.3 + rng.random() * 0.7)
+                    else:
+                        m = img.mean()
+                        img = m + (img - m) * (0.3 + rng.random() * 0.7)
+                flat = self._center(img)
                 scores = self.templates @ flat
                 if freq is not None:
                     scores = scores - conscience_beta * freq
@@ -58,16 +73,10 @@ class GlobalEye:
                     freq *= 0.999  # 缓慢衰减
 
     def activate(self, images):
-        N = len(images)
-        flat = images.reshape(N, -1).astype(np.float32)
-        flat = flat - flat.mean(axis=1, keepdims=True)
-        flat /= np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
-        return np.clip(flat @ self.templates.T, 0, 1).astype(np.float32)
+        return np.array([self.activate_one(img) for img in images], dtype=np.float32)
 
     def activate_one(self, image):
-        flat = image.reshape(-1).astype(np.float32)
-        flat = flat - flat.mean()
-        flat /= np.linalg.norm(flat) + 1e-8
+        flat = self._center(image)
         return np.clip(self.templates @ flat, 0, 1).astype(np.float32)
 
 
@@ -214,25 +223,40 @@ class ColdEye:
     # ── training ──
 
     def init_templates(self, images):
-        for eye in self.eyes: eye.init_templates(images)
+        gray = self._to_gray(images)
+        for eye in self.eyes:
+            eye.init_templates(gray if isinstance(eye, PatchEye) else images)
 
     def train(self, images, labels, epochs=3, n_train=None, contrast_aug=True, conscience_beta=0.0):
         n = n_train or len(images)
+        gray = self._to_gray(images)
         for i, eye in enumerate(self.eyes):
             t0 = time.time()
-            eye.train(images, epochs=epochs, n_train=n, contrast_aug=contrast_aug,
+            inp = gray if isinstance(eye, PatchEye) else images
+            eye.train(inp, epochs=epochs, n_train=n, contrast_aug=contrast_aug,
                       conscience_beta=conscience_beta)
             t = eye.n if isinstance(eye, GlobalEye) else len(eye.nids)
             print(f"  eye[{i}]: {type(eye).__name__} {t}d — {time.time()-t0:.0f}s")
 
     # ── feature extraction ──
 
+    @staticmethod
+    def _to_gray(img):
+        """RGB → 灰度 (PatchEye 用). 灰度图原样返回. 单张或批量."""
+        if img.ndim == 4 and img.shape[-1] == 3:  # RGB 批量 (N,H,W,3)
+            return (0.299*img[...,0] + 0.587*img[...,1] + 0.114*img[...,2]).astype(np.float32)
+        if img.ndim == 3 and img.shape[-1] == 3:  # RGB 单张 (H,W,3)
+            return (0.299*img[...,0] + 0.587*img[...,1] + 0.114*img[...,2]).astype(np.float32)
+        return img  # 灰度 (H,W) 或 (N,H,W)
+
     def _activate_one(self, image):
-        parts = [eye.activate_one(image) for eye in self.eyes]
+        gray = self._to_gray(image)
+        parts = [eye.activate_one(gray if isinstance(eye, PatchEye) else image) for eye in self.eyes]
         return np.concatenate(parts)
 
     def _activate_batch(self, images):
-        parts = [eye.activate(images) for eye in self.eyes]
+        gray = self._to_gray(images)
+        parts = [eye.activate(gray if isinstance(eye, PatchEye) else images) for eye in self.eyes]
         return np.concatenate(parts, axis=1)
 
     # ── optional K-means layers (legacy, not needed for v3) ──
@@ -513,11 +537,18 @@ class ColdEye:
         return best_label, best_sim
 
     def evaluate(self, images, labels, use_shapes=False):
-        correct = 0
-        for i in range(len(images)):
-            pred, _ = self.predict(images[i], use_shapes=use_shapes)
-            if pred == labels[i]: correct += 1
-        return correct / len(images)
+        # 向量化 1-NN: 预归一化 memory, 一次 matmul 算所有 query 的余弦
+        mem = np.array([m[0] for m in self.memory], np.float32)
+        mem_lbl = np.array([m[1] for m in self.memory], np.int64)
+        mem = mem / (np.linalg.norm(mem, axis=1, keepdims=True) + 1e-8)
+        if use_shapes:
+            queries = np.array([self.get_object_vector(im) for im in images], np.float32)
+        else:
+            queries = self._activate_batch(images)
+        queries = queries / (np.linalg.norm(queries, axis=1, keepdims=True) + 1e-8)
+        sims = queries @ mem.T          # (N, M) 余弦相似度
+        preds = mem_lbl[np.argmax(sims, axis=1)]
+        return np.mean(preds == labels)
 
     # ═══ 预测反馈 + 脑补 ═══
 
@@ -709,9 +740,9 @@ def low_contrast(X, c):
     return m + (Xc - m) * c
 
 
-def load_cifar10(path="data/cifar10", n_train_per_class=None, n_test_per_class=None):
-    """加载 CIFAR-10 (fast.ai 图片格式: {train,test}/{class}/{id}.png), 转灰度 32×32.
-    返回 (X_tr, y_tr, X_te, y_te) 灰度 [0,1]."""
+def load_cifar10(path="data/cifar10", gray=False, n_train_per_class=None, n_test_per_class=None):
+    """加载 CIFAR-10 (fast.ai 图片格式: {train,test}/{class}/{id}.png).
+    gray=False 返回 RGB (N,32,32,3), gray=True 返回灰度 (N,32,32). [0,1]"""
     from PIL import Image
     classes = ['airplane', 'automobile', 'bird', 'cat', 'deer',
                'dog', 'frog', 'horse', 'ship', 'truck']  # 字母序 = 官方 label 顺序
@@ -725,8 +756,9 @@ def load_cifar10(path="data/cifar10", n_train_per_class=None, n_test_per_class=N
             if n_per_class is not None:
                 files = files[:n_per_class]
             for f in files:
-                arr = np.array(Image.open(os.path.join(d, f)).convert('L'),
-                               dtype=np.float32) / 255.0
+                img = Image.open(os.path.join(d, f))
+                mode = 'L' if gray else 'RGB'
+                arr = np.array(img.convert(mode), dtype=np.float32) / 255.0
                 X.append(arr); y.append(cls_to_label[c])
         return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
 
