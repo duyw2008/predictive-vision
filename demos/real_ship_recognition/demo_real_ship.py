@@ -61,7 +61,15 @@ def otsu(x):
     return best
 
 def to28(x):
-    return np.array(Image.fromarray((x*255).astype(np.uint8)).resize((28,28), Image.LANCZOS)).astype(np.float32)/255
+    """letterbox: 保持长宽比缩放进 28×28 (长条形船不能硬压成方)"""
+    h, w = x.shape
+    scale = 28 / max(h, w)
+    nh, nw = max(1, int(h*scale)), max(1, int(w*scale))
+    r = np.array(Image.fromarray((x*255).astype(np.uint8)).resize((nw, nh), Image.LANCZOS)).astype(np.float32)/255
+    canvas = np.zeros((28, 28), np.float32)
+    y0 = (28-nh)//2; x0 = (28-nw)//2
+    canvas[y0:y0+nh, x0:x0+nw] = r
+    return canvas
 
 # ═══ 1. 颜色定位 + 填平 → 灰度剪影 ═══
 print("1. 颜色定位 (R通道, figure-ground)...")
@@ -114,73 +122,84 @@ def occlude(base, bs):
     o[y:y+bs, x:x+bs] = 0
     return o
 
-# 记忆扩充: 平移/缩放 + 缩小 + 遮挡变体 (覆盖降质空间)
+# 平移/缩放/缩小/遮挡/低对比度 变体工具
 var = variants(sil28)
-mem_ship = var[:5] + [shrink(sil28, 0.5), shrink(sil28, 0.3),
-                     occlude(sil28, 8), occlude(sil28, 14)]
-for v in mem_ship: model.memory.append((model._activate_one(v), 1))
-for img in geo[:5]: model.memory.append((model._activate_one(img), 0))
-
-# ═══ 3. 测试 ═══
-print("3. 测试...")
-in_mem = [model.predict(v)[0] for v in var[:5]]
-out_mem = [model.predict(v)[0] for v in var[5:]]
-geo_neg = [model.predict(geo[5+i])[0] for i in range(20)]
-gen_acc = sum(p==1 for p in out_mem)/len(out_mem)
-disc_acc = sum(p==0 for p in geo_neg)/len(geo_neg)
-print(f"   泛化率 {gen_acc:.0%}  判别率 {disc_acc:.0%}")
-
-# ═══ 4. 鲁棒性测试: 缩小 / 低对比度 / 遮挡 ═══
-print("4. 鲁棒性测试 (缩小/低对比度/遮挡)...")
-
-def low_contrast(base, cval):
-    return (base * cval).astype(np.float32)
-
-robust = [
+robust_tests = [
     ("缩小 0.5", shrink(sil28, 0.5)),
     ("缩小 0.3", shrink(sil28, 0.3)),
-    ("低对比度 c=0.1", low_contrast(sil28, 0.1)),
-    ("低对比度 c=0.01", low_contrast(sil28, 0.01)),
+    ("低对比度 c=0.1", (sil28*0.1).astype(np.float32)),
+    ("低对比度 c=0.01", (sil28*0.01).astype(np.float32)),
     ("遮挡 8×8", occlude(sil28, 8)),
     ("遮挡 14×14", occlude(sil28, 14)),
 ]
-robust_results = []
-for name, im in robust:
-    p, c = model.predict(im)
-    robust_results.append((name, im, p, c))
-    print(f"   {name}: {'船' if p==1 else '非船'} (置信度 {c:.2f})")
 
-# ═══ 5. 可视化 ═══
-fig = plt.figure(figsize=(16, 10))
+# ═══ 3. 三种记忆配置: 完整权衡 ═══
+print("3. 三种记忆配置对比 (鲁棒性 vs 判别力权衡)...")
+
+configs = {
+    "满框 (5 变体)": var[:5],
+    "轻度扩充 (+0.5缩小 +8遮挡)": var[:5] + [shrink(sil28,0.5), occlude(sil28,8)],
+    "重度扩充 (+0.3缩小 +14遮挡)": var[:5] + [shrink(sil28,0.5), shrink(sil28,0.3),
+                                            occlude(sil28,8), occlude(sil28,14)],
+}
+
+def evaluate(mem_ship):
+    model.memory = []
+    for v in mem_ship: model.memory.append((model._activate_one(v), 1))
+    for img in geo[:5]: model.memory.append((model._activate_one(img), 0))
+    robust = [(n, im, model.predict(im)[0]) for n, im in robust_tests]
+    robust_acc = sum(p==1 for _,_,p in robust) / len(robust)
+    disc = [model.predict(geo[5+i])[0] for i in range(20)]
+    disc_acc = sum(p==0 for p in disc) / len(disc)
+    return robust, robust_acc, disc_acc
+
+print(f"\n  {'记忆配置':<28s} {'鲁棒性':>8s} {'判别力':>8s}")
+print(f"  {'-'*46}")
+all_results = {}
+for name, mem in configs.items():
+    robust, ra, da = evaluate(mem)
+    all_results[name] = (robust, ra, da)
+    print(f"  {name:<28s} {ra:>7.0%} {da:>7.0%}")
+
+# ═══ 4. 可视化 ═══
+fig = plt.figure(figsize=(16, 11))
 gs = fig.add_gridspec(4, 6)
 
 ax = fig.add_subplot(gs[0, 0:2]); ax.imshow(img); ax.set_title('1. 原图 (彩色)'); ax.axis('off')
 ax = fig.add_subplot(gs[0, 2:4]); ax.imshow(R, cmap='gray'); ax.set_title('2. R通道 (找边界)'); ax.axis('off')
 ax = fig.add_subplot(gs[0, 4:6]); ax.imshow(closed, cmap='gray'); ax.set_title('3. 填平剪影'); ax.axis('off')
 
-# 识别结果: 4 个测试样本 (绿=正确)
-test_imgs = var[5:7] + list(geo[5:7])
-test_true = [1,1,0,0]
-for i, (im, t) in enumerate(zip(test_imgs, test_true)):
-    ax = fig.add_subplot(gs[1, i])
-    ax.imshow(im, cmap='gray')
-    p, c = model.predict(im)
-    color = 'green' if p == t else 'red'
-    ax.set_title(f"few-shot识别: {'船' if p==1 else '非船'}", color=color, fontsize=9)
-    for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
-    ax.set_xticks([]); ax.set_yticks([])
+# 三种配置的权衡条形图 (下方面板)
+names = list(configs.keys())
+ra_vals = [all_results[n][1] for n in names]
+da_vals = [all_results[n][2] for n in names]
+x = np.arange(len(names))
+ax_bar = fig.add_subplot(gs[2:4, 0:3])
+w = 0.35
+ax_bar.bar(x-w/2, ra_vals, w, label='鲁棒性', color='steelblue')
+ax_bar.bar(x+w/2, da_vals, w, label='判别力', color='coral')
+ax_bar.set_xticks(x); ax_bar.set_xticklabels(['满框','轻度','重度'], fontsize=9)
+ax_bar.set_ylim(0, 1.1); ax_bar.set_ylabel('准确率')
+ax_bar.legend(); ax_bar.set_title('记忆扩充的权衡')
 
-# 鲁棒性: 6 个降质样本
-for i, (name, im, p, c) in enumerate(robust_results):
-    ax = fig.add_subplot(gs[2:4, i])
+# 鲁棒性细节 (重度配置): 6 个降质样本
+ax_note = fig.add_subplot(gs[2, 3:6])
+ax_note.text(0.5, 0.5, '鲁棒性 = 降质样本识别为"船"的比例\n判别力 = 几何形状正确拒绝的比例\n\n满框: 只认完整船, 降质失败\n重度: 免疫所有降质, 但半擦除船太宽松\n  (14×14 遮挡 ≈ 半空形状 ≈ 几何形状)', 
+             ha='center', va='center', fontsize=9)
+ax_note.axis('off')
+
+# 重度配置的 6 个降质识别结果 (最下面一行)
+heavy_robust = all_results["重度扩充 (+0.3缩小 +14遮挡)"][0]
+for i, (name, im, p) in enumerate(heavy_robust):
+    ax = fig.add_subplot(gs[3, i])
     ax.imshow(im, cmap='gray')
     color = 'green' if p == 1 else 'red'
     label = '船' if p == 1 else '非船'
-    ax.set_title(f'{name}\n{label}', color=color, fontsize=8)
+    ax.set_title(f'{name}\n{label}', color=color, fontsize=7)
     for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
     ax.set_xticks([]); ax.set_yticks([])
 
-plt.suptitle(f'冷眼真实照片识别 demo — 颜色定位+填平+few-shot (泛化 {gen_acc:.0%}, 判别 {disc_acc:.0%})', fontsize=13)
+plt.suptitle('冷眼真实照片识别 demo — 颜色定位+填平+few-shot (完整权衡)', fontsize=13)
 plt.tight_layout()
 out_dir = os.path.join(os.path.dirname(__file__))
 plt.savefig(os.path.join(out_dir, 'demo_result.png'), dpi=120)
