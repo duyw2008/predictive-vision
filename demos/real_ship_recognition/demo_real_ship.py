@@ -102,8 +102,23 @@ def variants(base):
         out.append(c)
     return out
 
+def shrink(base, frac):
+    ns = max(2, int(28*frac))
+    r = np.array(Image.fromarray((base*255).astype(np.uint8)).resize((ns,ns), Image.LANCZOS)).astype(np.float32)/255
+    c = np.zeros((28,28), np.float32); y0=(28-ns)//2; c[y0:y0+ns, y0:y0+ns]=r
+    return c
+
+def occlude(base, bs):
+    o = base.copy()
+    y = np.random.RandomState(0).randint(0, 28-bs); x = np.random.RandomState(1).randint(0, 28-bs)
+    o[y:y+bs, x:x+bs] = 0
+    return o
+
+# 记忆扩充: 平移/缩放 + 缩小 + 遮挡变体 (覆盖降质空间)
 var = variants(sil28)
-for v in var[:5]: model.memory.append((model._activate_one(v), 1))
+mem_ship = var[:5] + [shrink(sil28, 0.5), shrink(sil28, 0.3),
+                     occlude(sil28, 8), occlude(sil28, 14)]
+for v in mem_ship: model.memory.append((model._activate_one(v), 1))
 for img in geo[:5]: model.memory.append((model._activate_one(img), 0))
 
 # ═══ 3. 测试 ═══
@@ -115,14 +130,33 @@ gen_acc = sum(p==1 for p in out_mem)/len(out_mem)
 disc_acc = sum(p==0 for p in geo_neg)/len(geo_neg)
 print(f"   泛化率 {gen_acc:.0%}  判别率 {disc_acc:.0%}")
 
-# ═══ 4. 可视化 ═══
-fig = plt.figure(figsize=(14, 6))
-gs = fig.add_gridspec(2, 4)
+# ═══ 4. 鲁棒性测试: 缩小 / 低对比度 / 遮挡 ═══
+print("4. 鲁棒性测试 (缩小/低对比度/遮挡)...")
 
-ax = fig.add_subplot(gs[0, 0]); ax.imshow(img); ax.set_title('1. 原图 (彩色)'); ax.axis('off')
-ax = fig.add_subplot(gs[0, 1]); ax.imshow(R, cmap='gray'); ax.set_title('2. R通道 (找边界)'); ax.axis('off')
-ax = fig.add_subplot(gs[0, 2]); ax.imshow(closed, cmap='gray'); ax.set_title('3. 填平剪影'); ax.axis('off')
-ax = fig.add_subplot(gs[0, 3]); ax.imshow(sil28, cmap='gray'); ax.set_title('4. 灰度剪影 28×28'); ax.axis('off')
+def low_contrast(base, cval):
+    return (base * cval).astype(np.float32)
+
+robust = [
+    ("缩小 0.5", shrink(sil28, 0.5)),
+    ("缩小 0.3", shrink(sil28, 0.3)),
+    ("低对比度 c=0.1", low_contrast(sil28, 0.1)),
+    ("低对比度 c=0.01", low_contrast(sil28, 0.01)),
+    ("遮挡 8×8", occlude(sil28, 8)),
+    ("遮挡 14×14", occlude(sil28, 14)),
+]
+robust_results = []
+for name, im in robust:
+    p, c = model.predict(im)
+    robust_results.append((name, im, p, c))
+    print(f"   {name}: {'船' if p==1 else '非船'} (置信度 {c:.2f})")
+
+# ═══ 5. 可视化 ═══
+fig = plt.figure(figsize=(16, 10))
+gs = fig.add_gridspec(4, 6)
+
+ax = fig.add_subplot(gs[0, 0:2]); ax.imshow(img); ax.set_title('1. 原图 (彩色)'); ax.axis('off')
+ax = fig.add_subplot(gs[0, 2:4]); ax.imshow(R, cmap='gray'); ax.set_title('2. R通道 (找边界)'); ax.axis('off')
+ax = fig.add_subplot(gs[0, 4:6]); ax.imshow(closed, cmap='gray'); ax.set_title('3. 填平剪影'); ax.axis('off')
 
 # 识别结果: 4 个测试样本 (绿=正确)
 test_imgs = var[5:7] + list(geo[5:7])
@@ -132,7 +166,17 @@ for i, (im, t) in enumerate(zip(test_imgs, test_true)):
     ax.imshow(im, cmap='gray')
     p, c = model.predict(im)
     color = 'green' if p == t else 'red'
-    ax.set_title(f"{'船' if p==1 else '非船'}", color=color)
+    ax.set_title(f"few-shot识别: {'船' if p==1 else '非船'}", color=color, fontsize=9)
+    for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
+    ax.set_xticks([]); ax.set_yticks([])
+
+# 鲁棒性: 6 个降质样本
+for i, (name, im, p, c) in enumerate(robust_results):
+    ax = fig.add_subplot(gs[2:4, i])
+    ax.imshow(im, cmap='gray')
+    color = 'green' if p == 1 else 'red'
+    label = '船' if p == 1 else '非船'
+    ax.set_title(f'{name}\n{label}', color=color, fontsize=8)
     for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
     ax.set_xticks([]); ax.set_yticks([])
 
