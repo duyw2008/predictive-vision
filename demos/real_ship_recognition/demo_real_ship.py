@@ -161,13 +161,39 @@ for name, mem in configs.items():
     all_results[name] = (robust, ra, da)
     print(f"  {name:<28s} {ra:>7.0%} {da:>7.0%}")
 
-# ═══ 4. 可视化 ═══
-fig = plt.figure(figsize=(16, 11))
+# ═══ 4. 对比度扫描 (centering 不变性) ═══
+print("\n4. 对比度扫描 (centering 不变性验证)...")
+# 用轻度配置记忆 (平衡点)
+model.memory = []
+for v in configs["轻度扩充 (+0.5缩小 +8遮挡)"]:
+    model.memory.append((model._activate_one(v), 1))
+for img in geo[:5]:
+    model.memory.append((model._activate_one(img), 0))
+
+contrast_levels = [1.0, 0.5, 0.1, 0.05, 0.01, 0.001, 0.0001]
+contrast_results = []
+for c in contrast_levels:
+    im = (sil28 * c).astype(np.float32)
+    p, conf = model.predict(im)
+    contrast_results.append((c, im, p, conf))
+    print(f"  c={c:g}: {'船' if p==1 else '非船'} (置信度 {conf:.3f})")
+
+# ═══ 5. 可视化 ═══
+fig = plt.figure(figsize=(16, 12))
 gs = fig.add_gridspec(4, 6)
 
 ax = fig.add_subplot(gs[0, 0:2]); ax.imshow(img); ax.set_title('1. 原图 (彩色)'); ax.axis('off')
 ax = fig.add_subplot(gs[0, 2:4]); ax.imshow(R, cmap='gray'); ax.set_title('2. R通道 (找边界)'); ax.axis('off')
 ax = fig.add_subplot(gs[0, 4:6]); ax.imshow(closed, cmap='gray'); ax.set_title('3. 填平剪影'); ax.axis('off')
+
+# 对比度扫描 (第1行): 6 个对比度等级
+for i, (c, im, p, conf) in enumerate(contrast_results[:6]):
+    ax = fig.add_subplot(gs[1, i])
+    ax.imshow(im, cmap='gray', vmin=0, vmax=1)
+    color = 'green' if p == 1 else 'red'
+    ax.set_title(f'c={c:g}\n{"船" if p==1 else "非船"}', color=color, fontsize=8)
+    for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
+    ax.set_xticks([]); ax.set_yticks([])
 
 # 三种配置的权衡条形图 (下方面板)
 names = list(configs.keys())
@@ -199,7 +225,7 @@ for i, (name, im, p) in enumerate(heavy_robust):
     for s in ax.spines.values(): s.set_edgecolor(color); s.set_linewidth(2)
     ax.set_xticks([]); ax.set_yticks([])
 
-plt.suptitle('冷眼真实照片识别 demo — 颜色定位+填平+few-shot (完整权衡)', fontsize=13)
+plt.suptitle('冷眼真实照片识别 demo — 颜色定位+填平+letterbox+few-shot (对比度扫描 + 权衡)', fontsize=13)
 plt.tight_layout()
 out_dir = os.path.join(os.path.dirname(__file__))
 plt.savefig(os.path.join(out_dir, 'demo_result.png'), dpi=120)
